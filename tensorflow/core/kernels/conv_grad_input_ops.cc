@@ -135,6 +135,7 @@ void LaunchConv2DBackpropInputOp<GPUDevice, T>::operator()(
   // input depth, it's a depthwise convolution. More generally, if the filter
   // in-depth divides but is smaller than the input depth, it is a grouped
   // convolution.
+  T alpha = T(1.0), beta = T(0.0);
   bool is_grouped_convolution = filter_shape.dim_size(2) != dims.in_depth;
   if (dims.spatial_dims[0].filter_size == 1 &&
       dims.spatial_dims[1].filter_size == 1 && !is_grouped_convolution &&
@@ -155,10 +156,14 @@ void LaunchConv2DBackpropInputOp<GPUDevice, T>::operator()(
 
     auto transpose = se::blas::Transpose::kTranspose;
     auto no_transpose = se::blas::Transpose::kNoTranspose;
-
-    OP_REQUIRES_OK(ctx, stream->ThenBlasGemm(
-                            transpose, no_transpose, n, m, k, b_ptr, k, a_ptr,
-                            k, &c_ptr, n, se::blas::kDefaultComputePrecision));
+    se::blas::GemmCall call{transpose, no_transpose, n, m, k, 
+        se::blas::ToDataType<T>::value,
+        &alpha,
+        &b_ptr, int(k), 
+        &a_ptr, int(k), 
+        &beta,
+        &c_ptr, int(n)};
+    OP_REQUIRES_OK(ctx, stream->ThenBlasGemm(call));
     return;
   } else if (dims.spatial_dims[0].filter_size ==
                  dims.spatial_dims[0].input_size &&
@@ -182,10 +187,14 @@ void LaunchConv2DBackpropInputOp<GPUDevice, T>::operator()(
 
     auto transpose = se::blas::Transpose::kTranspose;
     auto no_transpose = se::blas::Transpose::kNoTranspose;
-
-    OP_REQUIRES_OK(ctx, stream->ThenBlasGemm(
-                            transpose, no_transpose, n, m, k, b_ptr, k, a_ptr,
-                            k, &c_ptr, n, se::blas::kDefaultComputePrecision));
+    se::blas::GemmCall call{transpose, no_transpose, n, m, k, 
+        se::blas::ToDataType<T>::value,
+        &alpha,
+        &b_ptr, int(k), 
+        &a_ptr, int(k), 
+        &beta,
+        &c_ptr, int(n)};
+    OP_REQUIRES_OK(ctx, stream->ThenBlasGemm(call));
     return;
   }
 
@@ -219,7 +228,7 @@ void LaunchConv2DBackpropInputOp<GPUDevice, T>::operator()(
   const bool compute_in_nhwc = DataTypeToEnum<T>::value == DT_HALF &&
                                (stream->GetCudaComputeCapability().IsAtLeast(
                                    se::CudaComputeCapability::VOLTA) ||
-				UseNhwcLayoutForConvOnRocm(stream));
+                UseNhwcLayoutForConvOnRocm(stream));
 
   // We only do one directional conversion: NHWC->NCHW. We never convert in the
   // other direction. Grappler layout optimizer selects the preferred layout and

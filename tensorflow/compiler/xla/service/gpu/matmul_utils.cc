@@ -419,6 +419,7 @@ se::blas::MatrixDescriptor GetMatrixDesc(const MatrixLayout& layout,
   };
 }
 
+/*
 template <typename Input, typename Output>
 Status DoGemmWithAlgorithm(int64_t batch_size, int64_t m, int64_t n, int64_t k,
                            const se::blas::MatrixDescriptor& lhs,
@@ -428,6 +429,7 @@ Status DoGemmWithAlgorithm(int64_t batch_size, int64_t m, int64_t n, int64_t k,
                            se::blas::AlgorithmType algorithm,
                            se::blas::ComputePrecision compute_precision,
                            se::blas::ProfileResult* profile_result) {
+  static_assert(std::is_same<Input,Output>::value, "SE does not support input type != output type for GEMM"); 
   CHECK(output.transpose == se::blas::Transpose::kNoTranspose);
   PrimitiveType output_type = primitive_util::NativeToPrimitiveType<Output>();
   TF_ASSIGN_OR_RETURN(se::blas::ComputationType computation_type,
@@ -461,29 +463,32 @@ Status DoGemm(int64_t batch_size, int64_t m, int64_t n, int64_t k,
               se::blas::ProfileResult* profile_result) {
   CHECK(output.transpose == se::blas::Transpose::kNoTranspose);
   se::DeviceMemory<Input> output_data(output.data);
-
-  if (algorithm) {
-    return DoGemmWithAlgorithm<Input, Input>(
-        batch_size, m, n, k, lhs, rhs, output, alpha, beta, stream, *algorithm,
-        compute_precision, profile_result);
-  }
-
-  if (batch_size != 1) {
-    return stream->ThenBlasGemmStridedBatched(
-        lhs.transpose, rhs.transpose, m, n, k, alpha, lhs.cast<Input>(),
-        lhs.leading_dim_stride, lhs.batch_stride, rhs.cast<Input>(),
-        rhs.leading_dim_stride, rhs.batch_stride, beta, &output_data,
-        output.leading_dim_stride, output.batch_stride, batch_size,
-        compute_precision);
-  }
-
-  return stream->ThenBlasGemm(
-      lhs.transpose, rhs.transpose, m, n, k, alpha, lhs.cast<Input>(),
-      lhs.leading_dim_stride, rhs.cast<Input>(), rhs.leading_dim_stride, beta,
-      &output_data, output.leading_dim_stride, compute_precision);
-}
-
+  return DoGemmWithAlgorithm<Input, Input>(batch_size, m, n, k, lhs, rhs,
+                                           output, alpha, beta, stream,
+                                           algoritm ? *algorithm : se::kDefaultGemmAlgo,
+                                           profile_result);
+*/
 }  // namespace
+
+
+StatusOr<se::blas::DataType> AsBlasDataType(PrimitiveType dtype) {
+  switch (dtype) {
+    case F16:
+      return se::blas::DataType::kHalf;
+    case BF16:
+      return se::blas::DataType::kBF16;
+    case F32:
+      return se::blas::DataType::kFloat;
+    case F64:
+      return se::blas::DataType::kDouble;
+    case C64:
+      return se::blas::DataType::kComplexFloat;
+    case C128:
+      return se::blas::DataType::kComplexDouble;
+    default:
+      return InternalError("unsupported type");
+  }
+}
 
 Status RunGemm(const GemmConfig& config, se::DeviceMemoryBase lhs_buffer,
                se::DeviceMemoryBase rhs_buffer,
@@ -511,7 +516,80 @@ Status RunGemm(const GemmConfig& config, se::DeviceMemoryBase lhs_buffer,
   int64_t batch_size = output_layout.batch_size;
 
   if (!algorithm) algorithm = config.algorithm;
+/*
+  static_assert(std::is_same<Input,Output>::value, "SE does not support input type != output type for GEMM"); 
+  CHECK(output.transpose == se::blas::Transpose::kNoTranspose);
+  PrimitiveType output_type = primitive_util::NativeToPrimitiveType<Output>();
+  TF_ASSIGN_OR_RETURN(se::blas::ComputationType computation_type,
+                      GetBlasComputationType(output_type));
+  se::DeviceMemory<Output> output_data(output.data);
+*/
+  //Input alpha_cast = alpha, beta_cast = beta;
 
+  union number
+  {
+    int32_t i32;
+    Eigen::half h;
+    Eigen::bfloat16 b;
+    float f;
+    double d;
+    std::complex<float> cf;
+    std::complex<double> cd;
+    number() {}
+  };
+  number alpha_cast, beta_cast;
+  se::blas::GemmCall call{lhs.transpose, rhs.transpose, 
+        (uint64_t)m, (uint64_t)n, (uint64_t)k, 
+        AsBlasDataType(output_layout.dtype).ValueOrDie(),
+        &alpha_cast, &lhs_buffer,
+        int(lhs.leading_dim_stride), &rhs_buffer,
+        int(rhs.leading_dim_stride), &beta_cast, &output.data,
+        int(output.leading_dim_stride)};
+  call.batch_count = batch_size;
+  if(algorithm.has_value())
+    call.algorithm = algorithm.value();
+  call.output_profile_result = profile_result;
+  call.stride_a = lhs.batch_stride;
+  call.stride_b = rhs.batch_stride;
+  call.stride_c = output.batch_stride;
+  switch (output_layout.dtype) {
+    case S32: 
+      alpha_cast.i32 = static_cast<int32_t>(config.alpha.real());
+      beta_cast.i32 = static_cast<int32_t>(config.beta);
+      break;
+    case F16:
+      alpha_cast.h = static_cast<Eigen::half>(config.alpha.real());
+      beta_cast.h = static_cast<Eigen::half>(config.beta);
+      break;
+    case BF16:
+      alpha_cast.b = static_cast<Eigen::bfloat16>(config.alpha.real());
+      beta_cast.b = static_cast<Eigen::bfloat16>(config.beta);
+      break;
+    case F32:
+      alpha_cast.f = config.alpha.real();
+      beta_cast.f = config.beta;
+      break;
+    case F64:
+      alpha_cast.d = config.alpha.real();
+      beta_cast.d = config.beta;
+      break;
+    case C64:
+      alpha_cast.cf = static_cast<complex64>(config.alpha);
+      beta_cast.cf = static_cast<complex64>(config.beta);
+      break;
+    case C128:
+      alpha_cast.cd = config.alpha;
+      beta_cast.cd = static_cast<complex128>(config.beta);
+      break;
+    default:
+      return InternalError(
+          "Unexpected GEMM dtype: %s",
+          primitive_util::LowercasePrimitiveTypeName(output_layout.dtype));
+  }
+  return stream->ThenBlasGemm(call);
+
+
+/*
   switch (output_layout.dtype) {
     case S32:
       if (!algorithm) algorithm = se::blas::kDefaultGemmAlgo;
@@ -556,30 +634,12 @@ Status RunGemm(const GemmConfig& config, se::DeviceMemoryBase lhs_buffer,
           "Unexpected GEMM dtype: %s",
           primitive_util::LowercasePrimitiveTypeName(output_layout.dtype));
   }
+*/  
 }
 
 #if GOOGLE_CUDA
 
 namespace {
-
-StatusOr<se::blas::DataType> AsBlasDataType(PrimitiveType dtype) {
-  switch (dtype) {
-    case F16:
-      return se::blas::DataType::kHalf;
-    case BF16:
-      return se::blas::DataType::kBF16;
-    case F32:
-      return se::blas::DataType::kFloat;
-    case F64:
-      return se::blas::DataType::kDouble;
-    case C64:
-      return se::blas::DataType::kComplexFloat;
-    case C128:
-      return se::blas::DataType::kComplexDouble;
-    default:
-      return InternalError("unsupported type");
-  }
-}
 
 StatusOr<se::cuda::BlasLt::MatrixLayout> AsBlasLtMatrixLayout(
     const MatrixLayout& layout) {
