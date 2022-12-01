@@ -67,6 +67,7 @@ cublasComputeType_t AsCublasComputeType(blas::ComputationType type) {
     case blas::ComputationType::kF16:
       return CUBLAS_COMPUTE_16F;
     case blas::ComputationType::kF32:
+    case blas::ComputationType::kUndefined:
       return CUBLAS_COMPUTE_32F;
     case blas::ComputationType::kF64:
       return CUBLAS_COMPUTE_64F;

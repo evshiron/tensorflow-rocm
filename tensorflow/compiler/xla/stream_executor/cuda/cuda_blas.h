@@ -105,25 +105,9 @@ class CUDABlas : public blas::BlasSupport {
 
   // A helper function to implement DoBlasGemmBatched interfaces for generic
   // types.
-  template <typename T, typename Scalar, typename FuncT>
+  template <typename T, typename FuncT>
   port::Status DoBlasGemmBatchedInternal(
-      FuncT cublas_func, Stream *stream, blas::Transpose transa,
-      blas::Transpose transb, uint64_t m, uint64 n, uint64 k, Scalar alpha,
-      const DeviceMemorySlice<T> &a_array, int lda,
-      const DeviceMemorySlice<T> &b_array, int ldb, Scalar beta,
-      const DeviceMemorySlice<T> &c_array, int ldc, int batch_count,
-      ScratchAllocator *scratch_allocator);
-
-  // Helper function for implementing DoBlasGemmWithProfiling.
-  template <typename T, typename ParamType>
-  bool DoBlasGemmWithProfilingImpl(Stream *stream, blas::Transpose transa,
-                                   blas::Transpose transb, uint64_t m,
-                                   uint64_t n, uint64 k, const ParamType &alpha,
-                                   const DeviceMemory<T> &a, int lda,
-                                   const DeviceMemory<T> &b, int ldb,
-                                   const ParamType &beta, DeviceMemory<T> *c,
-                                   int ldc,
-                                   blas::ProfileResult *output_profile_result);
+      FuncT cublas_func, Stream *stream, const blas::BatchedGemmCall<T>& call);
 
   // Helper function for implementing DoBlasGemvWithProfiling.
   template <typename T>
@@ -134,6 +118,8 @@ class CUDABlas : public blas::BlasSupport {
                                    const T &beta, DeviceMemory<T> *y, int incy,
                                    blas::ProfileResult *output_profile_result);
 
+  port::Status DoBlasGemmInternal(Stream *stream, const blas::GemmCall& call);
+  port::Status DoBlasGemmStridedBatched(Stream *stream, const blas::GemmCall& call);
   // Guards the cuBLAS handle for this device.
   absl::Mutex mu_;
 
