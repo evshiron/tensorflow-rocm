@@ -47,13 +47,19 @@ limitations under the License.
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 #include "tensorflow/core/kernels/gpu_utils.h"
 #include "tensorflow/core/platform/stream_executor.h"
+#include "tensorflow/compiler/xla/stream_executor/host_or_device_scalar.h"
+#include "tensorflow/core/kernels/matmul_util.h"
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 #if GOOGLE_CUDA
 #include "third_party/gpus/cuda/include/cuda.h"
 #include "tensorflow/compiler/xla/stream_executor/cuda/cuda_blas_lt.h"
-#include "tensorflow/compiler/xla/stream_executor/host_or_device_scalar.h"
-#include "tensorflow/core/kernels/matmul_util.h"
 #endif  // GOOGLE_CUDA
+#if TENSORFLOW_USE_ROCM
+#include "rocm/rocm_config.h"
+#if TF_HIPBLASLT
+#include "tensorflow/compiler/xla/stream_executor/rocm/hip_blas_lt.h"
+#endif
+#endif
 
 namespace tensorflow {
 
@@ -284,7 +290,7 @@ struct LaunchBatchMatMul<CPUDevice, Scalar> {
   }
 };
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TF_HIPBLASLT
 
 namespace {
 // A dummy type to group matmul autotune results together.
@@ -398,9 +404,14 @@ struct LaunchBatchMatMul<GPUDevice, Scalar> {
                                     std::is_same_v<Scalar, Eigen::bfloat16>;
     using Coefficient = std::conditional_t<is_16bit_input, float, Scalar>;
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TF_HIPBLASLT
     static const bool use_autotune = MatmulAutotuneEnable();
-    if (EnableCublasLtGemm()) {
+    bool bCublasLtSupport = true;
+#if TF_HIPBLASLT
+    if(!std::is_same_v<Scalar, float>)
+      bCublasLtSupport = false;
+#endif
+    if (EnableCublasLtGemm() && bCublasLtSupport) {
       static const int64_t max_scratch_size =
           GetWorkspaceLimit(1LL << 32);  // 4GB by default
 
@@ -436,8 +447,7 @@ struct LaunchBatchMatMul<GPUDevice, Scalar> {
             std::move(plan_and_algorithms_or).value();
         const auto& plan = plan_and_algorithms->plan;
         const auto& algorithms = plan_and_algorithms->algorithms;
-
-        se::cuda::BlasLt* blas_lt = se::cuda::GetBlasLt(stream);
+        se::gpu::BlasLt* blas_lt = se::gpu::GetBlasLt(stream);
         OP_REQUIRES(context, blas_lt != nullptr,
                     errors::Internal("blaslt not supported"));
 
@@ -653,7 +663,7 @@ struct LaunchBatchMatMul<GPUDevice, Scalar> {
               ", k=", k, ", batch_size=", batch_size));
         }
       }
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TF_HIPBLASLT
     }
 #endif  // GOOGLE_CUDA
   }

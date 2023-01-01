@@ -643,8 +643,10 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
                                     bool b_mult_scale,
                                     std::vector<HloInstruction *> a_unary_ops,
                                     std::vector<HloInstruction *> b_unary_ops) {
+#if GOOGLE_CUDA
     auto cuda_compute_capability_ =
         std::get<se::CudaComputeCapability>(gpu_version_);
+
     // FP8 GEMM kernels are only available on Hopper and newer architectures.
     if (!cuda_compute_capability_.IsAtLeast(
             se::CudaComputeCapability::HOPPER)) {
@@ -895,6 +897,9 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
     TF_RETURN_IF_ERROR(
         ReplaceInstruction(instr, slice ? slice : new_custom_call));
     return true;
+#else
+    return false;
+#endif
   }
 
   Status F8ConvertD(HloInstruction *instr, HloInstruction *existing_gemm,
@@ -1545,7 +1550,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
       // Does not match type in unsupported case.
       return true;
     }
-
+#if GOOGLE_CUDA
     auto cuda_compute_capability_ =
         std::get<se::CudaComputeCapability>(gpu_version_);
     if (cuda_compute_capability_.IsAtLeast(se::CudaComputeCapability::AMPERE)) {
@@ -1555,7 +1560,7 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
       // architecture though (where TF32 was introduced).
       return true;
     }
-
+#endif
     // Get the rhs non-contracting dimensions as they will eventually be at the
     // cublasLt level.
     std::vector<int64_t> rhs_non_contracting_dims;

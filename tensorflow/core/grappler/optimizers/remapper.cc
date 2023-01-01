@@ -565,7 +565,7 @@ bool IsGpuCompatible(const RemapperContext& ctx,
 bool IsGpuCompatible(const RemapperContext& ctx,
                      const ContractionWithBiasAdd& matched,
                      const Cluster* cluster) {
-#if TENSORFLOW_USE_ROCM
+#if TENSORFLOW_USE_ROCM && !TF_HIPBLASLT
   // ROCm does not support _FusedMatMul
   return false;
 #endif

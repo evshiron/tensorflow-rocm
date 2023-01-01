@@ -113,10 +113,15 @@ void XlaPythonGpuCallback(gpuStreamHandle stream, void** buffers,
     absl::Span<int64_t const> strides(
         reinterpret_cast<const int64_t*>(array.strides()), array.ndim());
     if (strides == result.expected_strides) {
+<<<<<<< HEAD
       auto gpu_res =
           gpuMemcpyAsync(buffers[arity + i], array.data(), result.size_in_bytes,
                          gpuMemcpyHostToDevice, stream);
       CHECK_EQ(gpu_res, gpuSuccess) << "Failed to gpuMemcpyAsync";
+=======
+      auto err = gpuMemcpyAsync(buffers[arity + i], array.data(), result.size_in_bytes,
+                     gpuMemcpyHostToDevice, stream);
+>>>>>>> Initial support of hipblaslt
     } else {
       void* temp = new char[result.size_in_bytes];
       temp_buffers.push_back(temp);
@@ -129,6 +134,7 @@ void XlaPythonGpuCallback(gpuStreamHandle stream, void** buffers,
         throw xla::XlaRuntimeError(plan.status().ToString());
       }
       plan.value()->Execute(array.data(), temp);
+<<<<<<< HEAD
       auto gpu_res =
           gpuMemcpyAsync(buffers[arity + i], temp, result.size_in_bytes,
                          gpuMemcpyHostToDevice, stream);
@@ -138,6 +144,14 @@ void XlaPythonGpuCallback(gpuStreamHandle stream, void** buffers,
   py::gil_scoped_release release;
   CHECK_EQ(gpuStreamSynchronize(stream), gpuSuccess)
       << "Failed to gpuStreamSynchronize";
+=======
+      (void)gpuMemcpyAsync(buffers[arity + i], temp, result.size_in_bytes,
+                     gpuMemcpyHostToDevice, stream);
+    }
+  }
+  py::gil_scoped_release release;
+  auto err = gpuStreamSynchronize(stream);
+>>>>>>> Initial support of hipblaslt
   for (int i = 0; i < temp_buffers.size(); ++i) {
     delete[] static_cast<char*>(temp_buffers[i]);
   }

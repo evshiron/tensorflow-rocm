@@ -15,6 +15,7 @@ load("//tensorflow/tsl:tsl.bzl", "if_google", "if_nccl", "tsl_copts", "tsl_gpu_l
 load(
     "@local_config_rocm//rocm:build_defs.bzl",
     "if_rocm_is_configured",
+    "if_rocm_hipblaslt",
 )
 load("//tensorflow/compiler/xla:xla.bzl", "xla_cc_test")
 load("//tensorflow/compiler/xla/tests:build_defs.bzl", "xla_test")
@@ -377,7 +378,6 @@ cc_library(
     ] + if_gpu_is_configured([
         ":triangular_solve_thunk",
         ":cholesky_thunk",
-    ]) + if_cuda_is_configured([
         ":cublas_lt_matmul_thunk",
         ":ir_emitter_triton",
     ]),
@@ -1159,17 +1159,21 @@ cc_library(
 
 cc_library(
     name = "cublas_lt_matmul_thunk",
-    srcs = if_cuda_is_configured(["cublas_lt_matmul_thunk.cc"]),
-    hdrs = if_cuda_is_configured(["cublas_lt_matmul_thunk.h"]),
-    deps = if_cuda_is_configured([
+    srcs = if_gpu_is_configured(["cublas_lt_matmul_thunk.cc"]),
+    hdrs = if_gpu_is_configured(["cublas_lt_matmul_thunk.h"]),
+    deps = if_gpu_is_configured([
         ":matmul_utils",
         ":thunk",
         "//tensorflow/compiler/xla/service:buffer_assignment",
         "//tensorflow/compiler/xla:status",
         "//tensorflow/compiler/xla/stream_executor:device_memory",
         "//tensorflow/compiler/xla/stream_executor:stream_executor_headers",
+        "//tensorflow/tsl/platform:logging",
+    ]) + if_cuda_is_configured([
         "//tensorflow/compiler/xla/stream_executor/cuda:cublas_lt_header",
         "//tensorflow/compiler/xla/stream_executor/cuda:cublas_plugin",
+    ]) + if_rocm_is_configured([
+        "//tensorflow/compiler/xla/stream_executor/rocm:hipblas_lt_header",
     ]) + ["//tensorflow/tsl/platform:logging"],
 )
 
@@ -1254,7 +1258,7 @@ cc_library(
     srcs = ["matmul_utils.cc"],
     hdrs = ["matmul_utils.h"],
     compatible_with = get_compatible_with_cloud(),
-    defines = if_cuda_is_configured(["GOOGLE_CUDA=1"]),
+    defines = if_cuda_is_configured(["GOOGLE_CUDA=1"]) + if_rocm_is_configured(["TENSORFLOW_USE_ROCM=1"]),
     deps = [
         ":backend_configs_cc",
         ":ir_emission_utils",
@@ -1277,6 +1281,12 @@ cc_library(
         "//tensorflow/tsl/platform:tensor_float_32_hdr_lib",
         "//tensorflow/compiler/xla/stream_executor:host_or_device_scalar",
         "//tensorflow/compiler/xla/stream_executor:scratch_allocator",
+    ]) + if_rocm_is_configured([
+        "//tensorflow/compiler/xla/stream_executor/rocm:hipblas_lt_header",
+        "//tensorflow/compiler/xla/stream_executor/rocm:hipblaslt_plugin",
+        "//tensorflow/compiler/xla/stream_executor:host_or_device_scalar",
+        "//tensorflow/compiler/xla/stream_executor:scratch_allocator",
+        "//tensorflow/compiler/xla/stream_executor/platform:dso_loader",
     ]) + if_static([
         "//tensorflow/tsl/platform:tensor_float_32_utils",
     ]),
