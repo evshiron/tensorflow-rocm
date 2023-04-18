@@ -1823,6 +1823,8 @@ miopenDataType_t ToMIOpenDataType(
       return miopenFloat;
     case dnn::DataType::kHalf:
       return miopenHalf;
+    case dnn::DataType::kInt8:
+      return miopenInt8;
     case dnn::DataType::kDouble:
     default:
       LOG(FATAL) << "Invalid DNN data type: " << static_cast<int>(data_type);
