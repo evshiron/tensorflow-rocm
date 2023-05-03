@@ -185,6 +185,9 @@ StatusOr<HloInstruction*> EnsureIsConvBiasActivation(HloInstruction* conv) {
 StatusOr<bool> FuseConvertTypeIntoConv(HloComputation* comp,
                                        PrimitiveType conv_type,
                                        PrimitiveType cvt_type) {
+#if TENSORFLOW_USE_ROCM
+  return false;
+#endif
   bool changed = false;
   for (auto instr : comp->MakeInstructionPostOrder()) {
     HloInstruction* conv = nullptr;
@@ -264,6 +267,14 @@ StatusOr<bool> FuseConvAlpha(HloComputation* comp) {
       continue;
     }
 
+#if TENSORFLOW_USE_ROCM
+    if (conv->custom_call_target() == kCudnnConvForwardCallTarget) {
+      VLOG(0)<<conv->ToString() << " " << conv->convolution_dimension_numbers().kernel_spatial_dimensions_size();
+      if(conv->convolution_dimension_numbers().kernel_spatial_dimensions_size() > 2)
+        continue; // MIOpen does not correctly fuse Conv3D
+    }
+#endif
+
     // alpha is f32 except for f64 convs, where it's f64.  See
     // https://docs.nvidia.com/deeplearning/cudnn/api/index.html#cudnnConvolutionBiasActivationForward
     PrimitiveType alpha_ty = gte->shape().element_type() == F64 ? F64 : F32;
@@ -324,6 +335,11 @@ StatusOr<bool> FuseBiasOrSideInput(HloComputation* comp) {
     // !can_accept_bias && !can_accept_side_input, and our shiny new
     // bias-activation conv will be able to accept both.
     if (conv->custom_call_target() == kCudnnConvForwardCallTarget) {
+#if TENSORFLOW_USE_ROCM
+      VLOG(0)<<conv->ToString() << " " << conv->convolution_dimension_numbers().kernel_spatial_dimensions_size();
+      if(conv->convolution_dimension_numbers().kernel_spatial_dimensions_size() > 2)
+        continue; // MIOpen does not correctly fuse Conv3D
+#endif
       TF_ASSIGN_OR_RETURN(conv, EnsureIsConvBiasActivation(conv));
     }
 
@@ -520,11 +536,15 @@ StatusOr<bool> FuseElu(HloComputation* comp, se::CudaComputeCapability cc) {
   for (HloInstruction* instr : comp->MakeInstructionPostOrder()) {
     const DebugOptions& debug_options =
         instr->GetModule()->config().debug_options();
+#if GOOGLE_CUDA
     if (!debug_options.xla_gpu_use_runtime_fusion() ||
         !cc.IsAtLeast(se::CudaComputeCapability::AMPERE)) {
       return false;
     }
-
+#else
+    if (!debug_options.xla_gpu_use_runtime_fusion())
+      return false;
+#endif
     HloInstruction* gte;
     HloInstruction* conv;
     HloInstruction* expm1;
@@ -694,6 +714,9 @@ StatusOr<bool> FuseConvertToF16(HloComputation* comp) {
 }
 
 StatusOr<bool> FuseConvertToS8(HloComputation* comp) {
+#if TENSORFLOW_USE_ROCM
+  return false;
+#endif
   bool changed = false;
   for (HloInstruction* instr : comp->MakeInstructionPostOrder()) {
     HloInstruction* gte = nullptr;

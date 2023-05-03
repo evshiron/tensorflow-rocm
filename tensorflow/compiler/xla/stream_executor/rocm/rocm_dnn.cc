@@ -638,6 +638,7 @@ dnn::ProfileResult GetProfileResultFromConvAlgoPerf(
   int64_t algo_id;
   switch (kind) {
     case dnn::ConvolutionKind::FORWARD:
+    case dnn::ConvolutionKind::FORWARD_BIAS_ACTIVATION:
       algo_id = algorithm.fwd_algo;
       break;
     case dnn::ConvolutionKind::BACKWARD_DATA:
@@ -1118,10 +1119,10 @@ class ScopedNormalizeDescriptor {
 // around it
 class ScopedActivationDescriptor {
  public:
-  ScopedActivationDescriptor(dnn::ActivationMode activation_mode)
+  ScopedActivationDescriptor(dnn::ActivationMode activation_mode, double alpha=0.0)
       : handle_(nullptr),
         miopen_activation_mode_(miopenActivationPASTHRU),
-        alpha_(0.0),
+        alpha_(alpha),
         beta_(0.0),
         gamma_(0.0) {
     auto status = wrap::miopenCreateActivationDescriptor(&handle_);
@@ -1139,6 +1140,7 @@ class ScopedActivationDescriptor {
           break;
 
         case dnn::ActivationMode::kRelu:
+        case dnn::ActivationMode::kReluX:
           miopen_activation_mode_ = miopenActivationRELU;
           break;
 
@@ -1151,10 +1153,19 @@ class ScopedActivationDescriptor {
           miopen_activation_mode_ = miopenActivationTANH;
           break;
 
+        case dnn::ActivationMode::kElu:
+          miopen_activation_mode_ = miopenActivationELU;
+          break;
+
+        case dnn::ActivationMode::kLeakyRelu:
+          miopen_activation_mode_ = miopenActivationLEAKYRELU;
+          break;
+      // not supported as of 2023/05/04: kBandPass, kGeluExact
         default:
-          LOG(FATAL) << "Activation mode ("
+          VLOG(1) << "Activation mode ("
                      << dnn::ActivationModeString(activation_mode)
                      << ") not yet implemented";
+          throw tsl::errors::Internal("Activation not implemented");
           break;
       }
 
@@ -1412,12 +1423,13 @@ class ScopedFusionPlanConvolutionBiasActivation : public ScopedFusionPlanBase {
       miopenTensorDescriptor_t filter_descriptor,
       miopenConvolutionDescriptor_t conv_descriptor,
       miopenTensorDescriptor_t bias_descriptor,
-      ScopedActivationDescriptor& activation_descriptor)
+      ScopedActivationDescriptor& act_descriptor)
       : ScopedFusionPlanBase(miopen_handle, miopenVerticalFusion,
                              input_descriptor) {
+    VLOG(0) << "Fusion Plan compile begin";
     uint64_t hash = GetFusionOpHashValue(
         miopen_handle, input_descriptor, filter_descriptor, conv_descriptor,
-        bias_descriptor, activation_descriptor);
+        bias_descriptor, act_descriptor);
 
     bool is_compiled = CachedFusionPlans::FindOrCreate(
         hash, &fusion_plan_, miopenVerticalFusion, input_descriptor);
@@ -1425,26 +1437,26 @@ class ScopedFusionPlanConvolutionBiasActivation : public ScopedFusionPlanBase {
       miopenFusionOpDescriptor_t conv_op;
       auto status = wrap::miopenCreateOpConvForward(
           fusion_plan_, &conv_op, conv_descriptor, filter_descriptor);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "call to miopenCreateOpConvForward failed: "
-                   << ToString(status);
-      }
+      if (status != miopenStatusSuccess)
+        throw tsl::errors::Internal("miopenCreateOpConvForward failed: ",
+          ToString(status));
+
 
       miopenFusionOpDescriptor_t bias_op;
       status = wrap::miopenCreateOpBiasForward(fusion_plan_, &bias_op,
                                                bias_descriptor);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "call to miopenCreateOpBiasForward failed: "
-                   << ToString(status);
-      }
+      if (status != miopenStatusSuccess)
+        throw tsl::errors::Internal("miopenCreateOpBiasForward failed: ",
+          ToString(status));
 
-      miopenFusionOpDescriptor_t actv_op;
-      status = wrap::miopenCreateOpActivationForward(
-          fusion_plan_, &actv_op,
-          activation_descriptor.miopen_activation_mode_);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "call to miopenCreateOpActivationForward failed: "
-                   << ToString(status);
+      if(act_descriptor.miopen_activation_mode_ != miopenActivationPASTHRU) {
+        miopenFusionOpDescriptor_t actv_op;
+        status = wrap::miopenCreateOpActivationForward(
+            fusion_plan_, &actv_op,
+            act_descriptor.miopen_activation_mode_);
+        if (status != miopenStatusSuccess)
+          throw tsl::errors::Internal(
+            "miopenCreateOpActivationForward failed: ", ToString(status));
       }
 
       status = wrap::miopenCompileFusionPlan(miopen_handle_, fusion_plan_);
@@ -1454,7 +1466,7 @@ class ScopedFusionPlanConvolutionBiasActivation : public ScopedFusionPlanBase {
 
         CachedFusionPlans::MarkFusionPlanUnsupported(hash);
       } else {
-        VLOG(2) << "Fusion Plan compile succedded (CBA) ";
+        VLOG(0) << "Fusion Plan compile succedded (CBA) ";
         fusion_plan_compiled_ = true;
       }
     } else {
@@ -1837,6 +1849,16 @@ miopenDataType_t ToMIOpenDataType(
       LOG(FATAL) << "Invalid DNN data type: " << static_cast<int>(data_type);
   }
 }
+
+
+/***
+
+
+RNN
+
+
+***/
+
 
 miopenRNNInputMode_t ToMIOpenRnnInputMode(dnn::RnnInputMode input_mode) {
   switch (input_mode) {
@@ -3076,6 +3098,16 @@ void MIOpenDeallocatorCallback(void* ctx, void* mem) {
   // reclaim the memory
 }
 
+
+/***
+
+
+CONVOLVE
+
+
+***/
+
+
 tsl::Status MIOpenSupport::DoPrepareForConvolution(
     dnn::ConvolutionKind kind, dnn::DataType element_type, Stream* stream,
     const dnn::BatchDescriptor& input_descriptor, DeviceMemoryBase input_data,
@@ -3086,6 +3118,9 @@ tsl::Status MIOpenSupport::DoPrepareForConvolution(
     const dnn::AlgorithmConfig& algorithm_config,
     ScratchAllocator* scratch_allocator, dnn::AlgorithmDesc* algorithm_desc,
     DeviceMemory<uint8>* scratch_memory) {
+
+  VLOG(0) << "MIOpenSupport::DoPrepareForConvolution";
+
   std::optional<dnn::AlgorithmDesc> input_algo_desc =
       algorithm_config.algorithm();
 
@@ -3127,7 +3162,8 @@ class RocmConvRunner : public dnn::ConvRunner {
  public:
   RocmConvRunner(GpuExecutor* parent, MIOpenAccess* miopen, int64_t algo_id,
                  size_t workspace_size, dnn::ConvolutionKind kind,
-                 dnn::DataType input_type, bool use_immediate_mode,
+                 dnn::DataType input_type, dnn::DataType output_type, 
+                 bool use_immediate_mode,
                  BatchDescriptor input_descriptor,
                  BatchDescriptor output_descriptor,
                  FilterDescriptor filter_descriptor,
@@ -3139,7 +3175,7 @@ class RocmConvRunner : public dnn::ConvRunner {
         kind_(kind),
         use_immediate_mode_(use_immediate_mode),
         input_desc_{input_descriptor, ToMIOpenDataType(input_type)},
-        output_desc_{output_descriptor, ToMIOpenDataType(input_type)},
+        output_desc_{output_descriptor, ToMIOpenDataType(output_type)},
         filter_desc_{filter_descriptor, ToMIOpenDataType(input_type)},
         conv_desc_{conv_descriptor, ToMIOpenDataType(input_type)} {}
 
@@ -3293,6 +3329,9 @@ tsl::Status MIOpenSupport::DoConvolve(
     const dnn::ConvolutionDescriptor& convolution_descriptor,
     dnn::AlgorithmDesc algorithm_desc, DeviceMemory<uint8> scratch_memory,
     dnn::ProfileResult* output_profile_result) {
+
+  VLOG(0)<<"MIOpenSupport::DoConvolve";
+
   TF_ASSIGN_OR_RETURN(
       auto runner,
       ConvolveRunnerFromDesc(stream, algorithm_desc, kind, element_type,
@@ -3313,16 +3352,18 @@ tsl::Status MIOpenSupport::GetConvolveRunners(
     const dnn::ConvolutionDescriptor& convolution_descriptor, bool use_fallback,
     ScratchAllocator* scratch_allocator, const NumericOptions& numeric_options,
     std::vector<std::unique_ptr<const dnn::ConvRunner>>* out_runners) {
+  VLOG(0)<<"MIOpenSupport::GetConvolveRunners";
+/*  
   if (input_type != output_type) {
     return tsl::errors::Unimplemented(
         absl::StrFormat("MIOpen backend does not support different input and "
                         "output types: %d != %d",
                         input_type, output_type));
   }
-
+*/
   std::vector<dnn::ProfileResult> profile_results;
   if (!GetMIOpenConvolveAlgorithms(
-          kind, input_type, stream, input_descriptor, input_data,
+          kind, input_type, output_type, stream, input_descriptor, input_data,
           filter_descriptor, filter_data, output_descriptor, output_data,
           convolution_descriptor, scratch_allocator, &profile_results)) {
     return tsl::Status(
@@ -3350,27 +3391,25 @@ MIOpenSupport::ConvolveRunnerFromDesc(
     const dnn::FilterDescriptor& filter_descriptor,
     const dnn::BatchDescriptor& output_descriptor,
     const dnn::ConvolutionDescriptor& convolution_descriptor) {
-  if (input_type != output_type) {
-    return tsl::errors::Unimplemented(
-        absl::StrFormat("MIOpen backend does not support different input and "
-                        "output types: %d != %d",
-                        input_type, output_type));
-  }
-
+  VLOG(0) << "MIOpenSupport::ConvolveRunnerFromDesc";
   auto workspace_size = algorithm_desc.workspace_size();
+  /*
   if (!workspace_size) {
     return tsl::errors::InvalidArgument(
         "MIOpenSupport::ConvolveRunnerFromDesc requires "
         "AlgorithmProto.workspace_size, but it was missing.");
   }
+  */
   return {std::make_unique<RocmConvRunner>(
       parent_, miopen_.get(), algorithm_desc.algo_id(), *workspace_size, kind,
-      input_type, use_immediate_mode_, input_descriptor, output_descriptor,
+      input_type, output_type, use_immediate_mode_, 
+      input_descriptor, output_descriptor,
       filter_descriptor, convolution_descriptor)};
 }
 
 bool MIOpenSupport::GetMIOpenConvolveAlgorithms(
-    dnn::ConvolutionKind kind, dnn::DataType element_type, Stream* stream,
+    dnn::ConvolutionKind kind, dnn::DataType input_type,
+    dnn::DataType output_type, Stream* stream,
     const dnn::BatchDescriptor& input_descriptor, DeviceMemoryBase input_data,
     const dnn::FilterDescriptor& filter_descriptor,
     DeviceMemoryBase filter_data, const dnn::BatchDescriptor& output_descriptor,
@@ -3378,385 +3417,350 @@ bool MIOpenSupport::GetMIOpenConvolveAlgorithms(
     const dnn::ConvolutionDescriptor& convolution_descriptor,
     ScratchAllocator* scratch_allocator,
     std::vector<dnn::ProfileResult>* out_algorithms) {
-  return use_immediate_mode_
-             ? GetMIOpenConvolveAlgorithmsImmediateMode(
-                   kind, element_type, stream, input_descriptor, input_data,
-                   filter_descriptor, filter_data, output_descriptor,
-                   output_data, convolution_descriptor, scratch_allocator,
-                   out_algorithms)
-             : GetMIOpenConvolveAlgorithmsFindMode(
-                   kind, element_type, stream, input_descriptor, input_data,
-                   filter_descriptor, filter_data, output_descriptor,
-                   output_data, convolution_descriptor, scratch_allocator,
-                   out_algorithms);
-}
 
-bool MIOpenSupport::GetMIOpenConvolveAlgorithmsImmediateMode(
-    dnn::ConvolutionKind kind, dnn::DataType element_type, Stream* stream,
-    const dnn::BatchDescriptor& input_descriptor, DeviceMemoryBase input_data,
-    const dnn::FilterDescriptor& filter_descriptor,
-    DeviceMemoryBase filter_data, const dnn::BatchDescriptor& output_descriptor,
-    DeviceMemoryBase output_data,
-    const dnn::ConvolutionDescriptor& convolution_descriptor,
-    ScratchAllocator* scratch_allocator,
-    std::vector<dnn::ProfileResult>* out_algorithms) {
+  VLOG(0) << "MIOpenSupport::GetMIOpenConvolveAlgorithms " << (int)use_immediate_mode_;
+
   auto miopen = miopen_->GetHandle(parent_, stream);
 
   ScopedTensorDescriptor input_nd{input_descriptor,
-                                  ToMIOpenDataType(element_type)};
+                                  ToMIOpenDataType(input_type)};
   ScopedTensorDescriptor output_nd{output_descriptor,
-                                   ToMIOpenDataType(element_type)};
+                                   ToMIOpenDataType(output_type)};
   ScopedFilterDescriptor filter{filter_descriptor,
-                                ToMIOpenDataType(element_type)};
+                                ToMIOpenDataType(input_type)};
   ScopedConvolutionDescriptor conv{convolution_descriptor,
-                                   ToMIOpenDataType(element_type)};
+                                   ToMIOpenDataType(input_type)};
 
-  // First determine the number of algorityhms available
-  size_t maxSolutionCount = 0;
+  if(use_immediate_mode_) {
+    // First determine the number of algorityhms available
+    size_t maxSolutionCount = 0;
 
-  switch (kind) {
-    case dnn::ConvolutionKind::FORWARD: {
-      auto status = wrap::miopenConvolutionForwardGetSolutionCount(
-          miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
-          output_nd.handle(), &maxSolutionCount);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL)
-            << "call to miopenConvolutionForwardGetSolutionCount failed: "
-            << ToString(status);
-        return false;
-      }
-      break;
-    }
-    case dnn::ConvolutionKind::BACKWARD_DATA: {
-      auto status = wrap::miopenConvolutionBackwardDataGetSolutionCount(
-          miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
-          input_nd.handle(), &maxSolutionCount);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "call to miopenConvolutionBackwardDataGetSolutionCount "
-                      "failed: "
-                   << ToString(status);
-        return false;
-      }
-      break;
-    }
-    case dnn::ConvolutionKind::BACKWARD_FILTER: {
-      auto status = wrap::miopenConvolutionBackwardWeightsGetSolutionCount(
-          miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
-          filter.handle(), &maxSolutionCount);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL)
-            << "call to miopenConvolutionBackwardWeightsGetSolutionCount "
-               "failed: "
-            << ToString(status);
-        return false;
-      }
-      break;
-    }
-    default: {
-      LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
-      return false;
-      break;
-    }
-  }
-
-  VLOG(kConvDebugVlogLevel)
-      << "Number of conv solutions max: " << maxSolutionCount;
-
-  if (return_best_algo_only_) {
-    VLOG(kConvDebugVlogLevel) << "TF_ROCM_RETURN_BEST_ALGO_ONLY is set, "
-                              << "setting maxSolutionCount to 1";
-    maxSolutionCount = 1;
-  }
-
-  size_t solutionCount = 0;
-  std::unique_ptr<miopenConvSolution_t[]> solutions(
-      new miopenConvSolution_t[maxSolutionCount]);
-
-  switch (kind) {
-    case dnn::ConvolutionKind::FORWARD: {
-      auto status = wrap::miopenConvolutionForwardGetSolution(
-          miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
-          output_nd.handle(), maxSolutionCount, &solutionCount,
-          solutions.get());
-
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "call to miopenConvolutionForwardGetSolution failed: "
-                   << ToString(status);
-        return false;
-      }
-
-      VLOG(kConvDebugVlogLevel)
-          << "Number of conv solutions actual: " << solutionCount;
-
-      for (size_t i = 0; i < solutionCount; i++) {
-        miopenConvSolution_t solution = solutions[i];
-
-        VLOG(kConvDebugVlogLevel)
-            << "solution " << i << " (time, mem, id, algo) =  " << solution.time
-            << ", " << solution.workspace_size << ", " << solution.solution_id
-            << ", " << ToString(solution.algorithm);
-
-        status = wrap::miopenConvolutionForwardCompileSolution(
+    switch (kind) {
+      case dnn::ConvolutionKind::FORWARD: {
+        auto status = wrap::miopenConvolutionForwardGetSolutionCount(
             miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
-            output_nd.handle(), solution.solution_id);
-
+            output_nd.handle(), &maxSolutionCount);
         if (status != miopenStatusSuccess) {
           LOG(FATAL)
-              << "call to miopenConvolutionForwardCompileSolution failed: "
+              << "call to miopenConvolutionForwardGetSolutionCount failed: "
               << ToString(status);
           return false;
         }
-
-        out_algorithms->emplace_back(
-            GetProfileResultFromConvSolution(solution));
+        break;
       }
-      break;
-    }
-
-    case dnn::ConvolutionKind::BACKWARD_DATA: {
-      auto status = wrap::miopenConvolutionBackwardDataGetSolution(
-          miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
-          input_nd.handle(), maxSolutionCount, &solutionCount, solutions.get());
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL)
-            << "call to miopenConvolutionBackwardDataGetSolution failed: "
-            << ToString(status);
-        return false;
-      }
-
-      VLOG(kConvDebugVlogLevel)
-          << "Number of conv solutions actual: " << solutionCount;
-
-      for (size_t i = 0; i < solutionCount; i++) {
-        miopenConvSolution_t solution = solutions[i];
-
-        VLOG(kConvDebugVlogLevel)
-            << "solution " << i << " (time, mem, id, algo) =  " << solution.time
-            << ", " << solution.workspace_size << ", " << solution.solution_id
-            << ", " << ToString(solution.algorithm);
-
-        status = wrap::miopenConvolutionBackwardDataCompileSolution(
+      case dnn::ConvolutionKind::BACKWARD_DATA: {
+        auto status = wrap::miopenConvolutionBackwardDataGetSolutionCount(
             miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
-            input_nd.handle(), solution.solution_id);
-
+            input_nd.handle(), &maxSolutionCount);
         if (status != miopenStatusSuccess) {
-          LOG(FATAL) << " call to miopenConvolutionBackwardDataCompileSolution "
+          LOG(FATAL) << "call to miopenConvolutionBackwardDataGetSolutionCount "
                         "failed: "
                      << ToString(status);
           return false;
         }
-
-        out_algorithms->emplace_back(
-            GetProfileResultFromConvSolution(solution));
+        break;
       }
-      break;
-    }
-    case dnn::ConvolutionKind::BACKWARD_FILTER: {
-      auto status = wrap::miopenConvolutionBackwardWeightsGetSolution(
-          miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
-          filter.handle(), maxSolutionCount, &solutionCount, solutions.get());
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL)
-            << "call to miopenConvolutionBackwardWeightsGetSolution failed: "
-            << ToString(status);
-        return false;
-      }
-
-      VLOG(kConvDebugVlogLevel)
-          << "Number of conv solutions actual: " << solutionCount;
-
-      for (size_t i = 0; i < solutionCount; i++) {
-        miopenConvSolution_t solution = solutions[i];
-
-        VLOG(kConvDebugVlogLevel)
-            << "solution " << i << " (time, mem, id, algo) =  " << solution.time
-            << ", " << solution.workspace_size << ", " << solution.solution_id
-            << ", " << ToString(solution.algorithm);
-
-        status = wrap::miopenConvolutionBackwardWeightsCompileSolution(
-            miopen.handle(), output_nd.handle(), input_nd.handle(),
-            conv.handle(), filter.handle(), solution.solution_id);
-
+      case dnn::ConvolutionKind::BACKWARD_FILTER: {
+        auto status = wrap::miopenConvolutionBackwardWeightsGetSolutionCount(
+            miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
+            filter.handle(), &maxSolutionCount);
         if (status != miopenStatusSuccess) {
           LOG(FATAL)
-              << "call to miopenConvolutionBackwardWeightsCompileSolution "
+              << "call to miopenConvolutionBackwardWeightsGetSolutionCount "
                  "failed: "
               << ToString(status);
           return false;
         }
-
-        out_algorithms->emplace_back(
-            GetProfileResultFromConvSolution(solution));
+        break;
       }
-      break;
+      default: {
+        LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
+        return false;
+        break;
+      }
     }
-    default: {
-      LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
-      return false;
-      break;
+
+    VLOG(kConvDebugVlogLevel)
+        << "Number of conv solutions max: " << maxSolutionCount;
+
+    if (return_best_algo_only_) {
+      VLOG(kConvDebugVlogLevel) << "TF_ROCM_RETURN_BEST_ALGO_ONLY is set, "
+                                << "setting maxSolutionCount to 1";
+      maxSolutionCount = 1;
     }
+
+    size_t solutionCount = 0;
+    std::unique_ptr<miopenConvSolution_t[]> solutions(
+        new miopenConvSolution_t[maxSolutionCount]);
+
+    switch (kind) {
+      case dnn::ConvolutionKind::FORWARD: {
+        auto status = wrap::miopenConvolutionForwardGetSolution(
+            miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
+            output_nd.handle(), maxSolutionCount, &solutionCount,
+            solutions.get());
+
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL) << "call to miopenConvolutionForwardGetSolution failed: "
+                     << ToString(status);
+          return false;
+        }
+
+        VLOG(kConvDebugVlogLevel)
+            << "Number of conv solutions actual: " << solutionCount;
+
+        for (size_t i = 0; i < solutionCount; i++) {
+          miopenConvSolution_t solution = solutions[i];
+
+          VLOG(kConvDebugVlogLevel)
+              << "solution " << i << " (time, mem, id, algo) =  " << solution.time
+              << ", " << solution.workspace_size << ", " << solution.solution_id
+              << ", " << ToString(solution.algorithm);
+
+          status = wrap::miopenConvolutionForwardCompileSolution(
+              miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
+              output_nd.handle(), solution.solution_id);
+
+          if (status != miopenStatusSuccess) {
+            LOG(FATAL)
+                << "call to miopenConvolutionForwardCompileSolution failed: "
+                << ToString(status);
+            return false;
+          }
+
+          out_algorithms->emplace_back(
+              GetProfileResultFromConvSolution(solution));
+        }
+        break;
+      }
+
+      case dnn::ConvolutionKind::BACKWARD_DATA: {
+        auto status = wrap::miopenConvolutionBackwardDataGetSolution(
+            miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
+            input_nd.handle(), maxSolutionCount, &solutionCount, solutions.get());
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL)
+              << "call to miopenConvolutionBackwardDataGetSolution failed: "
+              << ToString(status);
+          return false;
+        }
+
+        VLOG(kConvDebugVlogLevel)
+            << "Number of conv solutions actual: " << solutionCount;
+
+        for (size_t i = 0; i < solutionCount; i++) {
+          miopenConvSolution_t solution = solutions[i];
+
+          VLOG(kConvDebugVlogLevel)
+              << "solution " << i << " (time, mem, id, algo) =  " << solution.time
+              << ", " << solution.workspace_size << ", " << solution.solution_id
+              << ", " << ToString(solution.algorithm);
+
+          status = wrap::miopenConvolutionBackwardDataCompileSolution(
+              miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
+              input_nd.handle(), solution.solution_id);
+
+          if (status != miopenStatusSuccess) {
+            LOG(FATAL) << " call to miopenConvolutionBackwardDataCompileSolution "
+                          "failed: "
+                       << ToString(status);
+            return false;
+          }
+
+          out_algorithms->emplace_back(
+              GetProfileResultFromConvSolution(solution));
+        }
+        break;
+      }
+      case dnn::ConvolutionKind::BACKWARD_FILTER: {
+        auto status = wrap::miopenConvolutionBackwardWeightsGetSolution(
+            miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
+            filter.handle(), maxSolutionCount, &solutionCount, solutions.get());
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL)
+              << "call to miopenConvolutionBackwardWeightsGetSolution failed: "
+              << ToString(status);
+          return false;
+        }
+
+        VLOG(kConvDebugVlogLevel)
+            << "Number of conv solutions actual: " << solutionCount;
+
+        for (size_t i = 0; i < solutionCount; i++) {
+          miopenConvSolution_t solution = solutions[i];
+
+          VLOG(kConvDebugVlogLevel)
+              << "solution " << i << " (time, mem, id, algo) =  " << solution.time
+              << ", " << solution.workspace_size << ", " << solution.solution_id
+              << ", " << ToString(solution.algorithm);
+
+          status = wrap::miopenConvolutionBackwardWeightsCompileSolution(
+              miopen.handle(), output_nd.handle(), input_nd.handle(),
+              conv.handle(), filter.handle(), solution.solution_id);
+
+          if (status != miopenStatusSuccess) {
+            LOG(FATAL)
+                << "call to miopenConvolutionBackwardWeightsCompileSolution "
+                   "failed: "
+                << ToString(status);
+            return false;
+          }
+
+          out_algorithms->emplace_back(
+              GetProfileResultFromConvSolution(solution));
+        }
+        break;
+      }
+      default: {
+        LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
+        return false;
+        break;
+      }
+    }
+
+    return true;
   }
+  else { // find mode
+    // Determine the workspace memory size that will need by the call to Find
+    size_t scratch_memory_size = 0;
+    switch (kind) {
+      case dnn::ConvolutionKind::FORWARD:
+      case dnn::ConvolutionKind::FORWARD_BIAS_ACTIVATION: {
+        auto status = wrap::miopenConvolutionForwardGetWorkSpaceSize(
+            miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
+            output_nd.handle(), &scratch_memory_size);
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL)
+              << "call to miopenConvolutionForwardGetWorkspaceSize failed: "
+              << ToString(status);
+          return false;
+        }
+        break;
+      }
+      case dnn::ConvolutionKind::BACKWARD_DATA: {
+        auto status = wrap::miopenConvolutionBackwardDataGetWorkSpaceSize(
+            miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
+            input_nd.handle(), &scratch_memory_size);
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL)
+              << "call to miopenConvolutionBackwardDataGetWorkspaceSize failed: "
+              << ToString(status);
+          return false;
+        }
+        break;
+      }
+      case dnn::ConvolutionKind::BACKWARD_FILTER: {
+        auto status = wrap::miopenConvolutionBackwardWeightsGetWorkSpaceSize(
+            miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
+            filter.handle(), &scratch_memory_size);
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL)
+              << "call to miopenConvolutionBackwardWeightsGetWorkspaceSize "
+                 "failed: "
+              << ToString(status);
+          return false;
+        }
+        break;
+      }
+      default: {
+        LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
+        return false;
+        break;
+      }
+    }
 
-  return true;
-}
-
-bool MIOpenSupport::GetMIOpenConvolveAlgorithmsFindMode(
-    dnn::ConvolutionKind kind, dnn::DataType element_type, Stream* stream,
-    const dnn::BatchDescriptor& input_descriptor, DeviceMemoryBase input_data,
-    const dnn::FilterDescriptor& filter_descriptor,
-    DeviceMemoryBase filter_data, const dnn::BatchDescriptor& output_descriptor,
-    DeviceMemoryBase output_data,
-    const dnn::ConvolutionDescriptor& convolution_descriptor,
-    ScratchAllocator* scratch_allocator,
-    std::vector<dnn::ProfileResult>* out_algorithms) {
-  auto miopen = miopen_->GetHandle(parent_, stream);
-
-  ScopedTensorDescriptor input_nd{input_descriptor,
-                                  ToMIOpenDataType(element_type)};
-  ScopedTensorDescriptor output_nd{output_descriptor,
-                                   ToMIOpenDataType(element_type)};
-  ScopedFilterDescriptor filter{filter_descriptor,
-                                ToMIOpenDataType(element_type)};
-  ScopedConvolutionDescriptor conv{convolution_descriptor,
-                                   ToMIOpenDataType(element_type)};
-
-  // Determine the workspace memory size that will need by the call to Find
-  size_t scratch_memory_size = 0;
-  switch (kind) {
-    case dnn::ConvolutionKind::FORWARD: {
-      auto status = wrap::miopenConvolutionForwardGetWorkSpaceSize(
-          miopen.handle(), filter.handle(), input_nd.handle(), conv.handle(),
-          output_nd.handle(), &scratch_memory_size);
-      if (status != miopenStatusSuccess) {
+    // allocate scratch memory
+    DeviceMemory<uint8> scratch_memory;
+    if (scratch_memory_size != 0) {
+      if (scratch_allocator == nullptr) {
         LOG(FATAL)
-            << "call to miopenConvolutionForwardGetWorkspaceSize failed: "
-            << ToString(status);
+            << "An allocator must be specified when scratch memory is needed";
         return false;
       }
-      break;
-    }
-    case dnn::ConvolutionKind::BACKWARD_DATA: {
-      auto status = wrap::miopenConvolutionBackwardDataGetWorkSpaceSize(
-          miopen.handle(), output_nd.handle(), filter.handle(), conv.handle(),
-          input_nd.handle(), &scratch_memory_size);
-      if (status != miopenStatusSuccess) {
+      auto allocated = scratch_allocator->AllocateBytes(scratch_memory_size);
+      if (allocated.ok()) {
+        scratch_memory = allocated.value();
+      } else {
         LOG(FATAL)
-            << "call to miopenConvolutionBackwardDataGetWorkspaceSize failed: "
-            << ToString(status);
+            << "Failed to allocate scratch memory - "
+            << allocated.status().message() << "\n"
+            << "\tYou can set the env var TF_CUDNN_WORKSPACE_LIMIT_IN_MB to a "
+               "larger number (e.g. 8192) to increase the max memory limit.\n"
+            << "\tIncreasing the max memory limit might help resolve this "
+               "error";
         return false;
       }
-      break;
     }
-    case dnn::ConvolutionKind::BACKWARD_FILTER: {
-      auto status = wrap::miopenConvolutionBackwardWeightsGetWorkSpaceSize(
-          miopen.handle(), output_nd.handle(), input_nd.handle(), conv.handle(),
-          filter.handle(), &scratch_memory_size);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL)
-            << "call to miopenConvolutionBackwardWeightsGetWorkspaceSize "
-               "failed: "
-            << ToString(status);
-        return false;
+
+    // Only get the best algorithm for Find Mode
+    size_t requestedAlgorithmCount = 1;
+
+    VLOG(kConvDebugVlogLevel)
+        << "Number of conv algortihms to request: " << requestedAlgorithmCount;
+
+    miopenConvAlgoPerf_t returnedAlgorithm;
+
+    int returnedAlgorithmCount = 0;
+    bool exhaustiveSearch = false;
+
+    switch (kind) {
+      case dnn::ConvolutionKind::FORWARD: 
+      case dnn::ConvolutionKind::FORWARD_BIAS_ACTIVATION: {
+        auto status = wrap::miopenFindConvolutionForwardAlgorithm(
+            miopen.handle(), input_nd.handle(), input_data.opaque(),
+            filter.handle(), filter_data.opaque(), conv.handle(),
+            output_nd.handle(), output_data.opaque(), requestedAlgorithmCount,
+            &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
+            scratch_memory_size, exhaustiveSearch);
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL) << "call to miopenFindConvolutionForwardAlgorithm failed: "
+                     << ToString(status);
+          return false;
+        }
+        break;
       }
-      break;
+      case dnn::ConvolutionKind::BACKWARD_DATA: {
+        auto status = wrap::miopenFindConvolutionBackwardDataAlgorithm(
+            miopen.handle(), output_nd.handle(), output_data.opaque(),
+            filter.handle(), filter_data.opaque(), conv.handle(),
+            input_nd.handle(), input_data.opaque(), requestedAlgorithmCount,
+            &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
+            scratch_memory_size, exhaustiveSearch);
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL)
+              << "call to miopenFindConvolutionBackwardDataAlgorithm failed: "
+              << ToString(status);
+          return false;
+        }
+        break;
+      }
+      case dnn::ConvolutionKind::BACKWARD_FILTER: {
+        auto status = wrap::miopenFindConvolutionBackwardWeightsAlgorithm(
+            miopen.handle(), output_nd.handle(), output_data.opaque(),
+            input_nd.handle(), input_data.opaque(), conv.handle(),
+            filter.handle(), filter_data.opaque(), requestedAlgorithmCount,
+            &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
+            scratch_memory_size, exhaustiveSearch);
+        if (status != miopenStatusSuccess) {
+          LOG(FATAL) << "call to miopenConvolutionBackwardWeightsAlgorithm "
+                        "failed: "
+                     << ToString(status);
+          return false;
+        }
+        break;
+      }
+      default: {
+        LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
+        return false;
+        break;
+      }
     }
-    default: {
-      LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
-      return false;
-      break;
-    }
+
+    out_algorithms->emplace_back(
+        GetProfileResultFromConvAlgoPerf(kind, returnedAlgorithm));
+
+    return true;
   }
-
-  // allocate scratch memory
-  DeviceMemory<uint8> scratch_memory;
-  if (scratch_memory_size != 0) {
-    if (scratch_allocator == nullptr) {
-      LOG(FATAL)
-          << "An allocator must be specified when scratch memory is needed";
-      return false;
-    }
-    auto allocated = scratch_allocator->AllocateBytes(scratch_memory_size);
-    if (allocated.ok()) {
-      scratch_memory = allocated.value();
-    } else {
-      LOG(FATAL)
-          << "Failed to allocate scratch memory - "
-          << allocated.status().message() << "\n"
-          << "\tYou can set the env var TF_CUDNN_WORKSPACE_LIMIT_IN_MB to a "
-             "larger number (e.g. 8192) to increase the max memory limit.\n"
-          << "\tIncreasing the max memory limit might help resolve this "
-             "error";
-      return false;
-    }
-  }
-
-  // Only get the best algorithm for Find Mode
-  size_t requestedAlgorithmCount = 1;
-
-  VLOG(kConvDebugVlogLevel)
-      << "Number of conv algortihms to request: " << requestedAlgorithmCount;
-
-  miopenConvAlgoPerf_t returnedAlgorithm;
-
-  int returnedAlgorithmCount = 0;
-  bool exhaustiveSearch = false;
-
-  switch (kind) {
-    case dnn::ConvolutionKind::FORWARD: {
-      auto status = wrap::miopenFindConvolutionForwardAlgorithm(
-          miopen.handle(), input_nd.handle(), input_data.opaque(),
-          filter.handle(), filter_data.opaque(), conv.handle(),
-          output_nd.handle(), output_data.opaque(), requestedAlgorithmCount,
-          &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
-          scratch_memory_size, exhaustiveSearch);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "call to miopenFindConvolutionForwardAlgorithm failed: "
-                   << ToString(status);
-        return false;
-      }
-      break;
-    }
-    case dnn::ConvolutionKind::BACKWARD_DATA: {
-      auto status = wrap::miopenFindConvolutionBackwardDataAlgorithm(
-          miopen.handle(), output_nd.handle(), output_data.opaque(),
-          filter.handle(), filter_data.opaque(), conv.handle(),
-          input_nd.handle(), input_data.opaque(), requestedAlgorithmCount,
-          &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
-          scratch_memory_size, exhaustiveSearch);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL)
-            << "call to miopenFindConvolutionBackwardDataAlgorithm failed: "
-            << ToString(status);
-        return false;
-      }
-      break;
-    }
-    case dnn::ConvolutionKind::BACKWARD_FILTER: {
-      auto status = wrap::miopenFindConvolutionBackwardWeightsAlgorithm(
-          miopen.handle(), output_nd.handle(), output_data.opaque(),
-          input_nd.handle(), input_data.opaque(), conv.handle(),
-          filter.handle(), filter_data.opaque(), requestedAlgorithmCount,
-          &returnedAlgorithmCount, &returnedAlgorithm, scratch_memory.opaque(),
-          scratch_memory_size, exhaustiveSearch);
-      if (status != miopenStatusSuccess) {
-        LOG(FATAL) << "call to miopenConvolutionBackwardWeightsAlgorithm "
-                      "failed: "
-                   << ToString(status);
-        return false;
-      }
-      break;
-    }
-    default: {
-      LOG(FATAL) << "Unexpected convolution kind " << static_cast<int>(kind);
-      return false;
-      break;
-    }
-  }
-
-  out_algorithms->emplace_back(
-      GetProfileResultFromConvAlgoPerf(kind, returnedAlgorithm));
-
-  return true;
 }
 
 bool MIOpenSupport::GetRnnAlgorithms(
@@ -3773,6 +3777,16 @@ bool MIOpenSupport::GetRnnAlgorithms(
   }
   return true;
 }
+
+
+/***
+
+
+BATCH NORMALIZATION
+
+
+***/
+
 
 bool MIOpenSupport::DoBatchNormalizationForward(
     Stream* stream, const DeviceMemory<Eigen::half>& x,
@@ -3933,23 +3947,13 @@ bool MIOpenSupport::DoBatchNormalizationBackwardImpl(
   return true;
 }
 
-tsl::Status MIOpenSupport::DoFusedConvolve(
-    Stream* stream, dnn::DataType input_type, dnn::DataType side_input_type,
-    dnn::DataType bias_type, dnn::DataType output_type,
-    const dnn::BatchDescriptor& conv_input_descriptor,
-    DeviceMemoryBase conv_input_data, double conv_input_scale,
-    const dnn::FilterDescriptor& filter_descriptor,
-    DeviceMemoryBase filter_data,
-    const dnn::ConvolutionDescriptor& convolution_descriptor,
-    DeviceMemoryBase side_input_data, double side_input_scale,
-    const dnn::BatchDescriptor& bias_descriptor, DeviceMemoryBase biases,
-    dnn::ActivationMode activation_mode,
-    const dnn::BatchDescriptor& output_descriptor, DeviceMemoryBase output_data,
-    ScratchAllocator* scratch_allocator,
-    const dnn::AlgorithmConfig& algorithm_config,
-    dnn::ProfileResult* output_profile_result) {
-  return tsl::errors::Unimplemented("fused convolve not implemented yet");
-}
+/***
+
+
+MISCELLANEOUS
+
+
+***/
 
 bool MIOpenSupport::DoTransformTensor(Stream* stream,
                                       const dnn::BatchDescriptor& input_desc,
@@ -4155,6 +4159,61 @@ bool MIOpenSupport::DoActivate(Stream* stream,
   LOG(ERROR) << "miopen does not support activation yet";
   return false;
 }
+
+bool MIOpenSupport::DoElementwiseOperate(
+    Stream* stream, dnn::ElementwiseOperation operation,
+    absl::Span<const dnn::BatchDescriptor> input_dimensions,
+    absl::Span<const DeviceMemory<float>* const> input_data,
+    const dnn::BatchDescriptor& output_dimensions,
+    DeviceMemory<float>* output_data) {
+  LOG(FATAL) << "not yet implemented";  // TODO(leary)
+  return false;
+}
+
+bool MIOpenSupport::DoXYPad(Stream* stream,
+                            const dnn::BatchDescriptor& dimensions,
+                            const DeviceMemory<float>& input_data,
+                            int64_t left_pad, int64_t right_pad,
+                            int64_t top_pad, int64_t bottom_pad,
+                            DeviceMemory<float>* output_data) {
+  LOG(FATAL) << "not yet implemented";  // TODO(leary)
+  return false;
+}
+
+bool MIOpenSupport::DoXYSlice(Stream* stream,
+                              const dnn::BatchDescriptor& dimensions,
+                              const DeviceMemory<float>& input_data,
+                              int64_t left_trim, int64_t right_trim,
+                              int64_t top_trim, int64_t bottom_trim,
+                              DeviceMemory<float>* output_data) {
+  LOG(FATAL) << "not yet implemented";  // TODO(leary)
+  return false;
+}
+
+bool MIOpenSupport::DoMemcpyD2HQuantized(
+    Stream* stream, const DeviceMemory<float>& gpu_unquantized_src,
+    dnn::QuantizedActivationMode mode, void* host_dst, int64_t size) {
+  LOG(ERROR) << "quantized memcpy not supported by MIOpen";
+  return false;
+}
+
+bool MIOpenSupport::DoMemcpyH2DQuantized(
+    Stream* stream, const void* host_src, int64_t size,
+    dnn::QuantizedActivationMode mode,
+    DeviceMemory<float>* gpu_unquantized_dst) {
+  LOG(ERROR) << "quantized memcpy not supported by MIOpen";
+  return false;
+}
+
+
+/***
+
+
+POOLING 
+
+
+***/
+
 
 tsl::Status MIOpenSupport::DoPoolForward(
     dnn::DataType element_type, Stream* stream,
@@ -4426,6 +4485,17 @@ tsl::Status MIOpenSupport::DoPoolBackward(
   return tsl::OkStatus();
 }
 
+
+/***
+
+
+NORMALIZE
+
+
+***/
+
+
+
 bool MIOpenSupport::DoNormalizeWithDimensions(
     Stream* stream, const dnn::NormalizeDescriptor& normalize_descriptor,
     const dnn::BatchDescriptor& dimensions,
@@ -4561,6 +4631,12 @@ bool MIOpenSupport::DoNormalizeBackwardWithDimensions(
   return true;
 }
 
+/***
+
+DEPTH CONCATENATE (unused)
+
+***/
+
 bool MIOpenSupport::DoDepthConcatenate(
     Stream* stream, absl::Span<const dnn::BatchDescriptor> input_dimensions,
     absl::Span<const DeviceMemory<float>* const> input_data,
@@ -4619,81 +4695,264 @@ bool MIOpenSupport::DoDepthConcatenate(
   return true;
 }
 
-bool MIOpenSupport::DoElementwiseOperate(
-    Stream* stream, dnn::ElementwiseOperation operation,
-    absl::Span<const dnn::BatchDescriptor> input_dimensions,
-    absl::Span<const DeviceMemory<float>* const> input_data,
-    const dnn::BatchDescriptor& output_dimensions,
-    DeviceMemory<float>* output_data) {
-  LOG(FATAL) << "not yet implemented";  // TODO(leary)
-  return false;
-}
 
-bool MIOpenSupport::DoXYPad(Stream* stream,
-                            const dnn::BatchDescriptor& dimensions,
-                            const DeviceMemory<float>& input_data,
-                            int64_t left_pad, int64_t right_pad,
-                            int64_t top_pad, int64_t bottom_pad,
-                            DeviceMemory<float>* output_data) {
-  LOG(FATAL) << "not yet implemented";  // TODO(leary)
-  return false;
-}
+/***
 
-bool MIOpenSupport::DoXYSlice(Stream* stream,
-                              const dnn::BatchDescriptor& dimensions,
-                              const DeviceMemory<float>& input_data,
-                              int64_t left_trim, int64_t right_trim,
-                              int64_t top_trim, int64_t bottom_trim,
-                              DeviceMemory<float>* output_data) {
-  LOG(FATAL) << "not yet implemented";  // TODO(leary)
-  return false;
-}
 
-bool MIOpenSupport::DoMemcpyD2HQuantized(
-    Stream* stream, const DeviceMemory<float>& gpu_unquantized_src,
-    dnn::QuantizedActivationMode mode, void* host_dst, int64_t size) {
-  LOG(ERROR) << "quantized memcpy not supported by MIOpen";
-  return false;
-}
+FUSED CONVOLUTION
 
-bool MIOpenSupport::DoMemcpyH2DQuantized(
-    Stream* stream, const void* host_src, int64_t size,
-    dnn::QuantizedActivationMode mode,
-    DeviceMemory<float>* gpu_unquantized_dst) {
-  LOG(ERROR) << "quantized memcpy not supported by MIOpen";
-  return false;
-}
 
-bool MIOpenSupport::DeriveOutputBatchDescriptor(
-    const BatchDescriptor& batch_descriptor,
-    const FilterDescriptor& filter_descriptor,
-    const dnn::ConvolutionDescriptor& convolution_descriptor,
-    dnn::BatchDescriptor* output_batch_descriptor) {
-  ScopedTensorDescriptor input_nd{batch_descriptor, miopenFloat};
-  ScopedFilterDescriptor filter{filter_descriptor, miopenFloat};
-  ScopedConvolutionDescriptor conv{convolution_descriptor, miopenFloat};
+***/
 
-  int dn = batch_descriptor.ndims() + 2;
-  std::vector<int> dims(dn);  // in BDYX
-  auto status = wrap::miopenGetConvolutionNdForwardOutputDim(
-      conv.handle(), input_nd.handle(), filter.handle(), &dn, dims.data());
-  if (status != miopenStatusSuccess) {
-    LOG(ERROR) << "could not get output tensor for convolution: "
-               << ToString(status);
-    return false;
+
+dnn::DataType GetConvAccumulatorType(dnn::DataType data_type) {
+  switch (data_type) {
+    case dnn::DataType::kFloat:
+    case dnn::DataType::kDouble:
+    case dnn::DataType::kHalf:
+    case dnn::DataType::kBF16:
+    case dnn::DataType::kInt32:
+      return data_type;
+    case dnn::DataType::kInt8:
+      return dnn::DataType::kInt32;
+    default:
+      LOG(FATAL) << "Invalid DNN data type: " << static_cast<int>(data_type);
   }
+}
 
-  output_batch_descriptor->set_count(dims[0])
-      .set_feature_map_count(dims[1])
-      .set_layout(batch_descriptor.layout());
-
-  for (int i = 0; i < batch_descriptor.ndims(); i++) {
-    output_batch_descriptor->set_spatial_dim(static_cast<dnn::DimIndex>(i),
-                                             dims.rbegin()[i]);
-  }
-
+bool MIOpenSupport::GetConvolveAlgorithms(
+    // ROCM TODO: refactor cc_major / cc_minor
+    CudaComputeCapability cuda_compute_capability, dnn::DataType input_type,
+    const NumericOptions& numeric_options,
+    std::vector<dnn::AlgorithmDesc>* out_algorithms) {
+  VLOG(0)<<"MIOpenSupport::GetConvolveAlgorithms";
+  out_algorithms->assign({
+      // clang-format off
+      dnn::AlgorithmDesc(miopenConvolutionFwdAlgoGEMM, false, 0),
+      dnn::AlgorithmDesc(miopenConvolutionFwdAlgoDirect, false, 0),
+      dnn::AlgorithmDesc(miopenConvolutionFwdAlgoFFT, false, 0),
+      dnn::AlgorithmDesc(miopenConvolutionFwdAlgoWinograd, false, 0),
+      // clang-format on
+  });
   return true;
 }
+
+class RocmFusedConvRunner : public dnn::FusedConvRunner {
+public:
+  std::string ToString() const override {
+    return MakeAlgorithmDesc().ToString();
+  }
+
+  uint64_t GetWorkspaceSize() const override { return workspace_size_; }
+
+  tsl::StatusOr<dnn::AlgorithmDesc> ToAlgorithmDesc() const override {
+    return MakeAlgorithmDesc();
+  }
+
+  tsl::Status operator()(Stream* stream, dnn::ProfileResult* profile_result,
+                         DeviceMemoryBase scratch_memory,
+                         DeviceMemoryBase input_data,
+                         DeviceMemoryBase filter_data,
+                         DeviceMemoryBase side_input_data,
+                         DeviceMemoryBase bias_data,
+                         DeviceMemoryBase output_data) const override {
+      if (static_cast<internal::StreamExecutorInterface*>(parent_) !=
+          stream->parent()->implementation()) {
+        return tsl::errors::Internal(
+            "RocmFusedConvRunner cached across multiple StreamExecutors.");
+      }
+
+      auto algo = MakeAlgorithmDesc();
+
+      std::unique_ptr<GpuTimer, GpuTimerDeleter> timer;
+      if (profile_result) {
+        timer.reset(new GpuTimer(parent_));  // NOLINT
+        // The start and stop of the timer should be as close to the Cudnn call as
+        // possible. It is still possible for other threads to issue workload on
+        // to this stream. So it could take multiple profiling measurements.
+        if (!timer->Init() || !timer->Start(AsGpuStream(stream))) {
+          return tsl::Status(absl::StatusCode::kInternal,
+                             "Failed to start timer");
+        }
+      }
+      /*
+      auto side_input_data_ptr = (side_input_scale_ == 0)
+                                     ? output_data.opaque()
+                                     : side_input_data.opaque();
+      */
+      auto miopen = miopen_->GetHandle(parent_, stream);
+
+      VLOG(0) << "\nconv_scale = " << conv_scale_
+              << "\nconv_input_nd.handle() = " << input_nd_.handle()
+              << "\nconv_input_data.opaque() = " << input_data.opaque()
+              << "\nfilter.handle() = " << filter_.handle()
+              << "\nfilter_data.opaque() = " << filter_data.opaque()
+              << "\nconv.handle() = " << conv_.handle() << "\nalgo = " << algo_id_
+              << "\nscratch.opaque() = " << scratch_memory.opaque()
+              << "\nscratch.size() = " << scratch_memory.size()
+              << "\nside_input_scale = " << side_input_scale_
+              << "\noutput_nd.handle() = " << output_nd_.handle()
+              << "\nbias_nd.handle() = " << bias_nd_.handle()
+              << "\nbiases.opaque() = " << bias_data.opaque()
+              << "\noutput_nd.handle() = " << output_nd_.handle()
+              << "\noutput_data.opaque() = " << output_data.opaque();
+      // N.B. the scaling parameters alpha1 and alpha2 are pointers to
+      // temporaries; this API doesn't persist the pointers beyond its own stack
+      // frame.
+
+    miopenStatus_t status = miopenStatusSuccess;
+
+    if (status == miopenStatusSuccess) {
+      fusion_plan_.SetConvolutionArgs(filter_data.opaque());
+    }
+
+    if (status == miopenStatusSuccess) {
+      status = fusion_plan_.SetBiasArgs(bias_data.opaque());
+    }
+
+    if (status == miopenStatusSuccess) {
+      // todo: set leakyrelu_alpha_
+      if(activation_desc_.miopen_activation_mode_ != miopenActivationPASTHRU)
+        status = fusion_plan_.SetActivationForwardArgs(activation_desc_);
+    }
+
+    if (status == miopenStatusSuccess) {
+      status =
+          fusion_plan_.Execute(input_nd_.handle(), input_data.opaque(),
+                              output_nd_.handle(), output_data.opaque());
+    }
+
+    if (status != miopenStatusSuccess) {
+      VLOG(0) << "Failed to enqueue fused convolution on stream: " << stream_executor::gpu::ToString(status);
+      return tsl::errors::Internal(
+          "Failed to enqueue fused convolution on stream: ", stream_executor::gpu::ToString(status));
+    }
+    VLOG(0) << "Successfully enqueued fused convolution";
+
+    if (profile_result) {
+      if (!timer->Stop(AsGpuStream(stream))) {
+        return tsl::Status(absl::StatusCode::kInternal, "Failed to stop timer");
+      }
+      profile_result->set_algorithm(algo);
+      profile_result->set_elapsed_time_in_ms(timer->GetElapsedMilliseconds());
+      profile_result->set_scratch_size(scratch_memory.size());
+      VLOG(4) << "conv, workspace_size=" << scratch_memory.size() << " -> "
+              << stream_executor::gpu::ToString(status) << " in "
+              << timer->GetElapsedMilliseconds() << "ms";
+    }
+
+    return ::tsl::OkStatus();
+  }
+
+ public:
+  // Queries the workspace size and constructs a 'RocmFusedConvRunner'.
+  template<typename... Args>
+  static tsl::StatusOr<std::unique_ptr<const dnn::FusedConvRunner>> Create(
+      GpuExecutor* parent, Stream* stream, MIOpenAccess* miopen,
+      const dnn::AlgorithmDesc& algo, 
+      Args... args) {
+    try {
+      return std::unique_ptr<const dnn::FusedConvRunner>(
+        new RocmFusedConvRunner(parent, stream, miopen, algo.algo_id(), 
+             /*workspace_size*/ 0, args...));
+    } catch (tsl::Status e) {
+      return e;
+    }
+  }
+
+ private:
+  // Private to prevent passing in the wrong workspace_size.
+  RocmFusedConvRunner(GpuExecutor* parent, Stream* stream, MIOpenAccess* miopen, 
+                            int64_t algo_id,
+                            size_t workspace_size, 
+                            dnn::DataType input_type,
+                            dnn::DataType bias_type,
+                            double conv_scale, double side_input_scale,
+                            double leakyrelu_alpha,
+                            BatchDescriptor input_nd, BatchDescriptor output_nd,
+                            FilterDescriptor filter, BatchDescriptor bias_nd,
+                            ConvolutionDescriptor conv,
+                            dnn::ActivationMode activation)
+      : parent_(parent),
+        miopen_(miopen),
+        algo_id_(algo_id),
+        workspace_size_(workspace_size),
+        input_type_(input_type),
+        bias_type_(bias_type),
+
+        conv_scale_(conv_scale),
+        side_input_scale_(side_input_scale),
+        leakyrelu_alpha_(leakyrelu_alpha),
+
+        input_nd_(input_nd, ToMIOpenDataType(input_type, input_nd.layout())),
+        output_nd_(output_nd, ToMIOpenDataType(input_type, input_nd.layout())),
+        filter_(filter, ToMIOpenDataType(input_type)),
+        bias_nd_(bias_nd, ToMIOpenDataType(bias_type)),
+        conv_(conv, ToMIOpenDataType(GetConvAccumulatorType(input_type))),
+        activation_desc_(activation, leakyrelu_alpha),
+        fusion_plan_(miopen_->GetHandle(parent, stream).handle(), input_nd_.handle(), filter_.handle(),
+          conv_.handle(), bias_nd_.handle(), activation_desc_)
+  {
+      if (!fusion_plan_.CompilationSucceeded()) {
+        throw tsl::errors::Internal("Failed to compile fused convolution");
+      }
+  }
+
+  // Internal form of ToAlgorithmDesc without the StatusOr.
+  dnn::AlgorithmDesc MakeAlgorithmDesc() const {
+    return {algo_id_, /*tensor_ops_enabled_*/ true, workspace_size_};
+  }
+
+  GpuExecutor* parent_;
+  MIOpenAccess* miopen_;
+  int64_t algo_id_;
+  //bool tensor_ops_enabled_;
+  size_t workspace_size_;
+  dnn::DataType input_type_, bias_type_;
+  double conv_scale_, side_input_scale_, leakyrelu_alpha_;
+
+  ScopedTensorDescriptor input_nd_;
+  ScopedTensorDescriptor output_nd_;
+  ScopedFilterDescriptor filter_;
+  ScopedTensorDescriptor bias_nd_;
+  ScopedConvolutionDescriptor conv_;
+  mutable ScopedActivationDescriptor activation_desc_;
+  mutable ScopedFusionPlanConvolutionBiasActivation fusion_plan_;
+};
+
+tsl::StatusOr<std::unique_ptr<const dnn::FusedConvRunner>>
+MIOpenSupport::FusedConvolveRunnerFromDesc(
+    Stream* stream, const dnn::AlgorithmDesc& algorithm_desc,
+    dnn::ConvolutionKind kind, dnn::DataType input_type,
+    dnn::DataType bias_type, dnn::DataType output_type, double conv_scale,
+    double side_input_scale, double leakyrelu_alpha,
+    const dnn::BatchDescriptor& input_descriptor,
+    const dnn::FilterDescriptor& filter_descriptor,
+    const dnn::BatchDescriptor& bias_descriptor,
+    const dnn::BatchDescriptor& output_descriptor,
+    const dnn::ConvolutionDescriptor& convolution_descriptor,
+    dnn::ActivationMode activation_mode) {
+
+  VLOG(0) << "MIOpenSupport::FusedConvolveRunnerFromDesc " << filter_descriptor.ndims();
+
+  if (filter_descriptor.ndims() > 2)
+    return tsl::errors::Unimplemented("MIOpen does not correctly fuse conv3d");
+
+    if(side_input_scale != 0)
+      return tsl::errors::Internal("MIOpen fused conv does not support side input");
+
+    try {
+      return RocmFusedConvRunner::Create(
+              parent_, stream, miopen_.get(), algorithm_desc, input_type, bias_type,
+              conv_scale, side_input_scale, leakyrelu_alpha,
+              input_descriptor, output_descriptor, filter_descriptor, bias_descriptor,
+              convolution_descriptor, activation_mode);
+    }
+    catch(tsl::Status e) {
+      return e;
+    }
+}
+
 
 template <typename T>
 bool MIOpenSupport::DoFusedConvolutionBiasActivationImpl(
@@ -4708,6 +4967,9 @@ bool MIOpenSupport::DoFusedConvolutionBiasActivationImpl(
     const DeviceMemory<T>& bias_data, dnn::ActivationMode activation_mode,
     const dnn::BatchDescriptor& output_descriptor, DeviceMemory<T>* output_data,
     dnn::ProfileResult* output_profile_result) {
+
+  VLOG(0) << "MIOpenSupport::DoFusedConvolutionBiasActivationImpl";
+
   auto miopen = miopen_->GetHandle(parent_, stream);
 
   ScopedTensorDescriptor conv_input_nd{
@@ -4727,63 +4989,67 @@ bool MIOpenSupport::DoFusedConvolutionBiasActivationImpl(
 
   ScopedActivationDescriptor activation_desc{activation_mode};
 
-  ScopedFusionPlanConvolutionBiasActivation fusion_plan{
-      miopen.handle(), conv_input_nd.handle(), filter.handle(),
-      conv.handle(),   bias_nd.handle(),       activation_desc};
+  try {
+    ScopedFusionPlanConvolutionBiasActivation fusion_plan{
+        miopen.handle(), conv_input_nd.handle(), filter.handle(),
+        conv.handle(),   bias_nd.handle(),       activation_desc};
 
-  bool retval = false;
+    bool retval = false;
 
-  if (fusion_plan.CompilationSucceeded()) {
-    const bool is_profiling = output_profile_result != nullptr;
+    if (fusion_plan.CompilationSucceeded()) {
+      const bool is_profiling = output_profile_result != nullptr;
 
-    std::unique_ptr<GpuTimer> timer;
-    if (is_profiling) {
-      timer.reset(new GpuTimer(parent_));
-      timer->Init();
-      timer->Start(AsGpuStream(stream));
-    }
+      std::unique_ptr<GpuTimer> timer;
+      if (is_profiling) {
+        timer.reset(new GpuTimer(parent_));
+        timer->Init();
+        timer->Start(AsGpuStream(stream));
+      }
 
-    miopenStatus_t status = miopenStatusSuccess;
+      miopenStatus_t status = miopenStatusSuccess;
 
-    if (status == miopenStatusSuccess) {
-      fusion_plan.SetConvolutionArgs(filter_data.opaque());
-    }
-
-    if (status == miopenStatusSuccess) {
-      status = fusion_plan.SetBiasArgs(bias_data.opaque());
-    }
-
-    if (status == miopenStatusSuccess) {
-      status = fusion_plan.SetActivationForwardArgs(activation_desc);
-    }
-
-    if (status == miopenStatusSuccess) {
-      status =
-          fusion_plan.Execute(conv_input_nd.handle(), conv_input_data.opaque(),
-                              output_nd.handle(), output_data->opaque());
-    }
-
-    if (is_profiling) {
-      timer->Stop(AsGpuStream(stream));
       if (status == miopenStatusSuccess) {
-        output_profile_result->set_elapsed_time_in_ms(
-            timer->GetElapsedMilliseconds());
+        fusion_plan.SetConvolutionArgs(filter_data.opaque());
       }
-      timer->Destroy();
-    }
 
-    if (status != miopenStatusSuccess) {
-      // Silently return when we are profiling.
-      if (!is_profiling) {
-        LOG(FATAL) << "failed to enqueue fused-convolution on stream: "
-                   << ToString(status);
+      if (status == miopenStatusSuccess) {
+        status = fusion_plan.SetBiasArgs(bias_data.opaque());
       }
-    }
 
-    retval = true;
+      if (status == miopenStatusSuccess) {
+        if(activation_desc.miopen_activation_mode_ != miopenActivationPASTHRU)
+          status = fusion_plan.SetActivationForwardArgs(activation_desc);
+      }
+
+      if (status == miopenStatusSuccess) {
+        status =
+            fusion_plan.Execute(conv_input_nd.handle(), conv_input_data.opaque(),
+                                output_nd.handle(), output_data->opaque());
+      }
+
+      if (is_profiling) {
+        timer->Stop(AsGpuStream(stream));
+        if (status == miopenStatusSuccess) {
+          output_profile_result->set_elapsed_time_in_ms(
+              timer->GetElapsedMilliseconds());
+        }
+        timer->Destroy();
+      }
+
+      if (status != miopenStatusSuccess) {
+        // Silently return when we are profiling.
+        if (!is_profiling) {
+          LOG(FATAL) << "failed to enqueue fused-convolution on stream: "
+                     << ToString(status);
+        }
+      }
+
+      retval = true;
+      return retval;
+    }
+  } catch(tsl::Status e) {
+    return false;
   }
-
-  return retval;
 }
 
 bool MIOpenSupport::DoFusedConvolutionBiasActivation(
@@ -4803,6 +5069,78 @@ bool MIOpenSupport::DoFusedConvolutionBiasActivation(
       bias_data, activation_mode, output_descriptor, output_data,
       output_profile_result);
 }
+
+
+tsl::Status MIOpenSupport::GetFusedConvolveRunners(
+    bool use_cudnn_frontend, dnn::ConvolutionKind kind,
+    dnn::DataType input_type, dnn::DataType bias_type,
+    dnn::DataType output_type, double conv_scale, 
+    double side_input_scale, double leakyrelu_alpha, Stream* stream,
+    const dnn::BatchDescriptor& input_descriptor,
+    const dnn::FilterDescriptor& filter_descriptor,
+    const dnn::BatchDescriptor& bias_descriptor,
+    const dnn::BatchDescriptor& output_descriptor,
+    const dnn::ConvolutionDescriptor& convolution_descriptor, 
+    bool use_fallback, dnn::ActivationMode activation_mode,
+    const NumericOptions& numeric_options,
+    std::vector<std::unique_ptr<const dnn::FusedConvRunner>>* out_exec_plans) {
+
+  VLOG(0) << "MIOpenSupport::GetFusedConvolveRunners";
+
+  VLOG(0) << "filter_descriptor " << filter_descriptor.ndims();
+  if (filter_descriptor.ndims() > 2)
+    return tsl::errors::Unimplemented("MIOpen does not correctly fuse conv3d");
+
+  std::vector<dnn::AlgorithmDesc> algorithms;
+
+  CudaComputeCapability cuda_compute_capability;
+  if (!GetConvolveAlgorithms(cuda_compute_capability, input_type,
+                             numeric_options, &algorithms))
+    return tsl::Status(absl::StatusCode::kUnknown,
+                       "Listing fused convolve algorithms failed.");
+
+  for (const auto& algo : algorithms) {
+    auto runner_or = FusedConvolveRunnerFromDesc(
+        stream, algo, kind, input_type, bias_type, output_type, conv_scale,
+        side_input_scale, leakyrelu_alpha, input_descriptor,
+        filter_descriptor, bias_descriptor, output_descriptor,
+        convolution_descriptor, activation_mode);
+    if (!runner_or.ok())
+      continue;
+    out_exec_plans->push_back(std::move(runner_or).value());
+  }
+  return ::tsl::OkStatus();
+}
+
+// Old style, presently unused (?)
+tsl::Status MIOpenSupport::DoFusedConvolve(
+    Stream* stream, dnn::DataType input_type, dnn::DataType side_input_type,
+    dnn::DataType bias_type, dnn::DataType output_type,
+    const dnn::BatchDescriptor& conv_input_descriptor,
+    DeviceMemoryBase conv_input_data, double conv_input_scale,
+    const dnn::FilterDescriptor& filter_descriptor,
+    DeviceMemoryBase filter_data,
+    const dnn::ConvolutionDescriptor& convolution_descriptor,
+    DeviceMemoryBase side_input_data, double side_input_scale,
+    const dnn::BatchDescriptor& bias_descriptor, DeviceMemoryBase biases,
+    dnn::ActivationMode activation_mode,
+    const dnn::BatchDescriptor& output_descriptor, DeviceMemoryBase output_data,
+    ScratchAllocator* scratch_allocator,
+    const dnn::AlgorithmConfig& algorithm_config,
+    dnn::ProfileResult* output_profile_result) {
+  VLOG(0) << "MIOpenSupport::DoFusedConvolve";
+  return tsl::errors::Unimplemented("fused convolve not implemented yet");
+}
+
+
+/***
+
+
+FUSED BATCH NORM + ACTIVATION
+
+
+***/
+
 
 template <typename T, typename U>
 bool MIOpenSupport::DoFusedBatchNormActivationInferenceImpl(
@@ -4850,7 +5188,8 @@ bool MIOpenSupport::DoFusedBatchNormActivationInferenceImpl(
     }
 
     if (status == miopenStatusSuccess) {
-      status = fusion_plan.SetActivationForwardArgs(activation_desc);
+      if(activation_desc.miopen_activation_mode_ != miopenActivationPASTHRU)
+        status = fusion_plan.SetActivationForwardArgs(activation_desc);
     }
 
     if (status == miopenStatusSuccess) {
@@ -4962,7 +5301,8 @@ bool MIOpenSupport::DoFusedBatchNormActivationForwardImpl(
     }
 
     if (status == miopenStatusSuccess) {
-      status = fusion_plan.SetActivationForwardArgs(activation_desc);
+      if(activation_desc.miopen_activation_mode_ != miopenActivationPASTHRU)
+        status = fusion_plan.SetActivationForwardArgs(activation_desc);
     }
 
     if (status == miopenStatusSuccess) {
@@ -5155,6 +5495,7 @@ bool MIOpenSupport::DoFusedBatchNormActivationBackward(
       saved_mean_data, saved_var_data, x_bn_backprop_data, scale_backprop_data,
       offset_backprop_data, output_profile_result);
 }
+
 
 // A helper function to decide whether to use
 // NHWC in Convolution/Batchnorm. This mode can be faster in
