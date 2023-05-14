@@ -70,7 +70,7 @@ PACKAGES=(
 # Special casing by version of Python
 # E.g., numpy supports py3.10 only from 1.21.3
 if [[ ${PYTHON_VERSION} -eq 10 ]]; then
-  "${PIP_INSTALL[@]}" "numpy==1.21.3"
+  "${PIP_INSTALL[@]}" "numpy>=1.21.3"
 else
   "${PIP_INSTALL[@]}" "numpy==1.19"
 fi

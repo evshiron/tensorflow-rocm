@@ -99,7 +99,8 @@ def _rocm_version(rocm_install_path):
 
 # Append the ROCM version to the version string
 if project_name.endswith('_rocm'):
-  _VERSION = _VERSION + "." + str(_rocm_version(_get_rocm_install_path()).replace('.', ''))
+  #_VERSION = _VERSION + "." + str(_rocm_version(_get_rocm_install_path()).replace('.', ''))
+  _VERSION = _VERSION + ".1100"
 
 
 # All versions of TF need these packages. We indicate the widest possible range
@@ -121,7 +122,7 @@ REQUIRED_PACKAGES = [
     'h5py >= 2.9.0',
     'keras_preprocessing >= 1.1.1',  # 1.1.0 needs tensorflow==1.7
     'libclang >= 13.0.0',
-    'numpy >= 1.20, < 1.23',  # 1.23 is causing some unit test fails
+    'numpy >= 1.20',  # 1.23 is causing some unit test fails
     'opt_einsum >= 2.3.2',
     'packaging',
     # TODO(b/182876485): Protobuf 3.20 results in linker errors on Windows
